@@ -787,6 +787,26 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_add_ack_reaction_noop_when_disabled(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _ReactionAPI:
+            def create(self, request):
+                raise AssertionError("ACK reaction should not be created when disabled")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message_reaction=_ReactionAPI()))
+        )
+
+        with patch("gateway.platforms.feishu._FEISHU_ACK_REACTION_ENABLED", False):
+            reaction_id = asyncio.run(adapter._add_ack_reaction("om_msg"))
+
+        self.assertIsNone(reaction_id)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_ack_reaction_events_are_ignored_to_avoid_feedback_loops(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -804,6 +824,202 @@ class TestAdapterBehavior(unittest.TestCase):
             adapter._on_reaction_event("im.message.reaction.created_v1", data)
 
         run_threadsafe.assert_not_called()
+
+    @patch.dict(os.environ, {"FEISHU_TYPING_INDICATOR": "true", "FEISHU_TYPING_EMOJI": "Typing"}, clear=True)
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_send_typing_creates_reaction_on_source_message(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._typing_source_message_ids["chat_1"] = "om_src"
+        captured = {}
+
+        class _ReactionAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(reaction_id="r_typing_1"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message_reaction=_ReactionAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(adapter.send_typing("chat_1"))
+
+        self.assertEqual(captured["request"].message_id, "om_src")
+        self.assertEqual(
+            captured["request"].request_body.reaction_type["emoji_type"], "Typing",
+        )
+        self.assertEqual(adapter._typing_reaction_state["chat_1"]["reaction_id"], "r_typing_1")
+
+    @patch.dict(os.environ, {"FEISHU_TYPING_INDICATOR": "true", "FEISHU_TYPING_EMOJI": "Typing"}, clear=True)
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_send_typing_is_idempotent(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._typing_source_message_ids["chat_1"] = "om_src"
+        adapter._typing_reaction_state["chat_1"] = {
+            "message_id": "om_src",
+            "reaction_id": "r_existing",
+        }
+        call_count = 0
+
+        class _ReactionAPI:
+            def create(self, request):
+                nonlocal call_count
+                call_count += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(reaction_id="r_new"))
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message_reaction=_ReactionAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(adapter.send_typing("chat_1"))
+
+        self.assertEqual(call_count, 0, "send_typing should not create duplicate reactions")
+
+    @patch.dict(os.environ, {"FEISHU_TYPING_INDICATOR": "true", "FEISHU_TYPING_EMOJI": "Typing"}, clear=True)
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_stop_typing_deletes_tracked_reaction(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._typing_source_message_ids["chat_1"] = "om_src"
+        adapter._typing_reaction_state["chat_1"] = {
+            "message_id": "om_src",
+            "reaction_id": "r_typing_1",
+        }
+        captured = {}
+
+        class _ReactionAPI:
+            def delete(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message_reaction=_ReactionAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(adapter.stop_typing("chat_1"))
+
+        self.assertEqual(captured["request"].message_id, "om_src")
+        self.assertEqual(captured["request"].reaction_id, "r_typing_1")
+        self.assertNotIn("chat_1", adapter._typing_reaction_state)
+        self.assertNotIn("chat_1", adapter._typing_source_message_ids)
+
+    @patch.dict(os.environ, {"FEISHU_TYPING_INDICATOR": "true", "FEISHU_TYPING_EMOJI": "Typing"}, clear=True)
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_stop_typing_noop_when_no_tracked_reaction(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message_reaction=SimpleNamespace()))
+        )
+
+        # Should not raise when there's nothing to clean up
+        asyncio.run(adapter.stop_typing("chat_unknown"))
+
+    @patch.dict(os.environ, {"FEISHU_TYPING_INDICATOR": "false"}, clear=True)
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_send_typing_noop_when_disabled(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._typing_source_message_ids["chat_1"] = "om_src"
+        call_count = 0
+
+        class _ReactionAPI:
+            def create(self, request):
+                nonlocal call_count
+                call_count += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(reaction_id="r_new"))
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message_reaction=_ReactionAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(adapter.send_typing("chat_1"))
+
+        self.assertEqual(call_count, 0)
+
+    @patch.dict(os.environ, {"FEISHU_TYPING_INDICATOR": "true", "FEISHU_TYPING_EMOJI": "Typing"}, clear=True)
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
+    def test_typing_reaction_events_are_ignored_to_avoid_feedback_loops(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = object()
+        event = SimpleNamespace(
+            message_id="om_msg",
+            operator_type="user",
+            reaction_type=SimpleNamespace(emoji_type="Typing"),
+        )
+        data = SimpleNamespace(event=event)
+
+        with patch("gateway.platforms.feishu.asyncio.run_coroutine_threadsafe") as run_threadsafe:
+            adapter._on_reaction_event("im.message.reaction.created_v1", data)
+
+        run_threadsafe.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_handle_message_with_guards_does_not_track_typing_for_reaction_events(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._add_ack_reaction = AsyncMock(return_value=None)
+        adapter.handle_message = AsyncMock()
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+        )
+        event = MessageEvent(
+            text="reaction:added:smile",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_bot_message",
+            raw_message=SimpleNamespace(
+                event=SimpleNamespace(reaction_type=SimpleNamespace(emoji_type="smile"))
+            ),
+        )
+
+        asyncio.run(adapter._handle_message_with_guards(event))
+
+        adapter._add_ack_reaction.assert_awaited_once_with("om_bot_message")
+        adapter.handle_message.assert_awaited_once_with(event)
+        self.assertNotIn("oc_chat", adapter._typing_source_message_ids)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_normalize_inbound_text_strips_feishu_mentions(self):

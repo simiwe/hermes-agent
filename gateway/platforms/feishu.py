@@ -169,6 +169,13 @@ _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup win
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
+_FEISHU_ACK_REACTION_ENABLED = os.getenv("FEISHU_ACK_REACTION", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_FEISHU_TYPING_EMOJI = os.getenv("FEISHU_TYPING_EMOJI", "Typing").strip() or "Typing"
+_FEISHU_TYPING_ENABLED = os.getenv("FEISHU_TYPING_INDICATOR", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 # ---------------------------------------------------------------------------
 # Fallback display strings
 # ---------------------------------------------------------------------------
@@ -1056,6 +1063,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        # Typing indicator state (reaction-based — see send_typing / stop_typing)
+        self._typing_source_message_ids: Dict[str, str] = {}   # chat_id → inbound message_id
+        self._typing_reaction_state: Dict[str, Dict[str, str]] = {}  # chat_id → {message_id, reaction_id}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1611,7 +1621,102 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Feishu bot API does not expose a typing indicator."""
+        """Show a typing indicator by adding an emoji reaction to the inbound message.
+
+        Feishu has no native typing API, so we repurpose message reactions as a
+        visual processing indicator — similar to how ``_add_ack_reaction`` marks
+        receipt.  The reaction is removed by ``stop_typing`` when the agent
+        finishes processing.
+
+        ``_keep_typing`` in the base class calls this every ~2 s.  The method is
+        idempotent: once a reaction is tracked for *chat_id* it returns
+        immediately until ``stop_typing`` clears the state.
+        """
+        if not _FEISHU_TYPING_ENABLED or not self._client:
+            return None
+
+        message_id = self._typing_source_message_ids.get(chat_id)
+        if not message_id:
+            return None
+
+        # Idempotent — skip if we already have a tracked reaction for this message
+        current = self._typing_reaction_state.get(chat_id)
+        if current and current.get("message_id") == message_id and current.get("reaction_id"):
+            return None
+
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": _FEISHU_TYPING_EMOJI})
+                .build()
+            )
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            if response and getattr(response, "success", lambda: False)():
+                data = getattr(response, "data", None)
+                reaction_id = getattr(data, "reaction_id", None) or ""
+                self._typing_reaction_state[chat_id] = {
+                    "message_id": message_id,
+                    "reaction_id": reaction_id,
+                }
+                return None
+            logger.warning(
+                "[Feishu] Failed to add typing reaction on %s: code=%s msg=%s",
+                message_id,
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+        except Exception:
+            logger.warning("[Feishu] Failed to add typing reaction on %s", message_id, exc_info=True)
+        return None
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Remove the typing-indicator reaction added by ``send_typing``."""
+        if not self._client:
+            return None
+
+        current = self._typing_reaction_state.pop(chat_id, None) or {}
+        message_id = current.get("message_id") or self._typing_source_message_ids.get(chat_id)
+        reaction_id = current.get("reaction_id")
+        # Always clean up source tracking so the next message starts fresh
+        self._typing_source_message_ids.pop(chat_id, None)
+
+        if not message_id or not reaction_id:
+            return None
+
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            request = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            response = await asyncio.to_thread(self._client.im.v1.message_reaction.delete, request)
+            if response and getattr(response, "success", lambda: False)():
+                return None
+            logger.warning(
+                "[Feishu] Failed to remove typing reaction %s on %s: code=%s msg=%s",
+                reaction_id,
+                message_id,
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+        except Exception:
+            logger.warning(
+                "[Feishu] Failed to remove typing reaction on %s",
+                message_id,
+                exc_info=True,
+            )
         return None
 
     async def send_image(
@@ -1806,6 +1911,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if (
             operator_type in {"bot", "app"}
             or emoji_type == _FEISHU_ACK_EMOJI
+            or emoji_type == _FEISHU_TYPING_EMOJI
             or not message_id
             or loop is None
             or bool(getattr(loop, "is_closed", lambda: False)())
@@ -2016,8 +2122,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
         - Per-chat lock: ensures messages in the same chat are processed one at a time
           (matches openclaw's createChatQueue serial queue behaviour).
-        - ACK indicator: adds a CHECK reaction to the triggering message before handing
-          off to the agent and leaves it in place as a receipt marker.
+                - ACK indicator: when enabled, adds a CHECK reaction to the triggering
+                    message before handing off to the agent and leaves it in place as a
+                    receipt marker.
+        - Typing indicator: records the inbound message_id so that ``send_typing``
+          (called by the base-class ``_keep_typing`` loop) can attach a reaction
+          to it.  ``stop_typing`` removes it when the agent finishes.
         """
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
@@ -2025,11 +2135,37 @@ class FeishuAdapter(BasePlatformAdapter):
             message_id = event.message_id
             if message_id:
                 await self._add_ack_reaction(message_id)
+            # Record the inbound message so _keep_typing → send_typing can
+            # attach a reaction to it.  Synthetic reaction/card events reuse
+            # _handle_message_with_guards() but should not seed typing state.
+            # handle_message() spawns a background task that will clean this
+            # up via stop_typing() in its finally.
+            if chat_id and message_id and self._should_track_typing_source(event):
+                self._typing_source_message_ids[chat_id] = message_id
             await self.handle_message(event)
+
+    @staticmethod
+    def _should_track_typing_source(event: MessageEvent) -> bool:
+        """Return True when ``event`` came from a real inbound user message.
+
+        Synthetic Feishu reaction and card-action events are routed through the
+        same guard path, but their ``message_id`` values refer to an existing
+        bot message or a callback token rather than a fresh inbound message.
+        Using them as typing targets would place the reaction on the wrong
+        object or trigger avoidable API failures.
+        """
+        raw_event = getattr(getattr(event, "raw_message", None), "event", None)
+        if raw_event is None:
+            return True
+        if getattr(raw_event, "reaction_type", None) is not None:
+            return False
+        if getattr(raw_event, "action", None) is not None:
+            return False
+        return True
 
     async def _add_ack_reaction(self, message_id: str) -> Optional[str]:
         """Add a persistent ACK emoji reaction to signal the message was received."""
-        if not self._client or not message_id:
+        if not _FEISHU_ACK_REACTION_ENABLED or not self._client or not message_id:
             return None
         try:
             from lark_oapi.api.im.v1 import (  # lazy import — keeps optional dep optional
